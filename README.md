@@ -19,6 +19,14 @@ HMD 없이 테스트할 때는 `ENTER XR`를 누르면 자동으로 `BROWSER PRE
 
 접속 흐름은 `Main 화면 → Robot IP 입력 → ENTER VR → Teleoperation View`입니다. 콘솔 우측 상단의 `MAIN` 버튼으로 Robot IP 입력 화면으로 돌아갈 수 있습니다.
 
+Chrome 계열 브라우저에서 음성 버튼을 켜면 다음 명령을 사용할 수 있습니다.
+
+- 초기 화면: `connect`, `연결`, `접속`
+- 동작 제어: `hold`, `resume`, `start teleop`, `stop teleop`
+- 안전 제어: `e-stop`, `emergency stop`, `reset stop`
+
+음성 인식은 Web Speech API를 사용하며 브라우저/권한에 따라 지원 여부가 다릅니다. 마이크 권한을 허용해야 하고, 미지원 브라우저에서는 기존 버튼을 사용하면 됩니다.
+
 ## 현재 포함된 기능
 
 - Front Stereo / Left Wrist / Right Wrist mock camera feed

@@ -1,4 +1,4 @@
-import { StrictMode, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { StrictMode, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import sampleUiUrl from '../sample_ui.png'
@@ -6,6 +6,15 @@ import sampleUiUrl from '../sample_ui.png'
 type CameraId = 'front' | 'left' | 'right'
 type Arm = 'L' | 'R'
 type XrMode = 'immersive-ar' | 'immersive-vr'
+type VoiceCommand = 'connect' | 'hold' | 'resume' | 'estop' | 'reset-estop' | 'teleop-start' | 'teleop-stop' | 'unknown'
+
+interface VoiceRecognitionResultEvent { results: ArrayLike<{ 0: { transcript: string } }> }
+interface VoiceRecognition { lang: string; continuous: boolean; interimResults: boolean; onstart: (() => void) | null; onend: (() => void) | null; onerror: ((event: { error: string }) => void) | null; onresult: ((event: VoiceRecognitionResultEvent) => void) | null; start: () => void; stop: () => void }
+type VoiceRecognitionConstructor = new () => VoiceRecognition
+
+declare global {
+  interface Window { SpeechRecognition?: VoiceRecognitionConstructor; webkitSpeechRecognition?: VoiceRecognitionConstructor }
+}
 
 const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
   const paths: Record<string, ReactNode> = {
@@ -22,6 +31,7 @@ const Icon = ({ name, size = 18 }: { name: string; size?: number }) => {
     sliders: <><path d="M4 4v12m6-12v12m6-12v12"/><path d="M2 7h4m6 5h4M8 9h4m4 5h4"/></>,
     expand: <><path d="M3 8V3h5M17 8V3h-5M3 12v5h5m9-5v5h-5"/></>,
     headset: <><path d="M3 12a7 7 0 0 1 14 0v5h-3v-5h3M3 12v5h3v-5H3Z"/></>,
+    mic: <><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v3M7 18h6"/></>,
     chevron: <path d="m6 8 4 4 4-4"/>,
   }
   return <svg width={size} height={size} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>
@@ -37,6 +47,18 @@ function CornerFrame({ className = '' }: { className?: string }) {
 
 const cameraNames: Record<CameraId, string> = { front: 'FRONT STEREO', left: 'LEFT WRIST', right: 'RIGHT WRIST' }
 
+function parseVoiceCommand(value: string): VoiceCommand {
+  const text = value.toLowerCase().replace(/[.,!?]/g, ' ')
+  if (/(e\s*stop|emergency stop|비상 정지|비상정지|긴급 정지|긴급정지)/i.test(text)) return 'estop'
+  if (/(reset stop|release e stop|clear stop|정지 해제|비상 정지 해제)/i.test(text)) return 'reset-estop'
+  if (/(start teleop|teleop start|begin teleoperation|start operation|텔레옵 시작|텔레오퍼레이션 시작|작업 시작)/i.test(text)) return 'teleop-start'
+  if (/(stop teleop|teleop stop|stop operation|pause teleop|텔레옵 중지|텔레오퍼레이션 중지|작업 중지)/i.test(text)) return 'teleop-stop'
+  if (/(resume|continue|재개|계속)/i.test(text)) return 'resume'
+  if (/(hold|pause|일시 정지|홀드|멈춰)/i.test(text)) return 'hold'
+  if (/(connect|연결|접속|커넥트)/i.test(text)) return 'connect'
+  return 'unknown'
+}
+
 function App() {
   const [activeCamera, setActiveCamera] = useState<CameraId>('front')
   const [mode, setMode] = useState<'teleop' | 'autonomous'>('teleop')
@@ -50,6 +72,11 @@ function App() {
   const [robotIp, setRobotIp] = useState('192.168.0.42')
   const [showConsole, setShowConsole] = useState(false)
   const [connectionError, setConnectionError] = useState('')
+  const [voiceListening, setVoiceListening] = useState(false)
+  const [voiceTranscript, setVoiceTranscript] = useState('')
+  const [voiceError, setVoiceError] = useState('')
+  const recognitionRef = useRef<VoiceRecognition | null>(null)
+  const voiceCommandRef = useRef<(text: string) => void>(() => undefined)
 
   const focus = useMemo(() => ({ front: 70, left: 15, right: 15 }), [])
 
@@ -96,10 +123,67 @@ function App() {
     await enterXR('immersive-vr')
   }
 
+  const handleVoiceCommand = (text: string) => {
+    const command = parseVoiceCommand(text)
+    setVoiceTranscript(text)
+    setVoiceError(command === 'unknown' ? 'Command not recognized' : '')
+    if (command === 'connect' && !showConsole) return void openTeleopView()
+    if (!showConsole) return
+    if (command === 'hold' || command === 'teleop-stop') {
+      setIsHeld(true)
+      return
+    }
+    if (command === 'resume' || command === 'teleop-start') {
+      setMode('teleop')
+      setIsHeld(false)
+      setIsStopped(false)
+      return
+    }
+    if (command === 'estop') {
+      setIsStopped(true)
+      setIsHeld(true)
+      return
+    }
+    if (command === 'reset-estop') {
+      setIsStopped(false)
+    }
+  }
+
+  voiceCommandRef.current = handleVoiceCommand
+
+  const toggleVoice = () => {
+    const Recognition = typeof window !== 'undefined' ? (window.SpeechRecognition ?? window.webkitSpeechRecognition) : undefined
+    if (!Recognition) {
+      setVoiceError('Voice input is not supported in this browser')
+      return
+    }
+    if (!recognitionRef.current) {
+      const recognition = new Recognition()
+      recognition.lang = navigator.language.toLowerCase().startsWith('ko') ? 'ko-KR' : 'en-US'
+      recognition.continuous = true
+      recognition.interimResults = false
+      recognition.onstart = () => { setVoiceListening(true); setVoiceError('') }
+      recognition.onend = () => setVoiceListening(false)
+      recognition.onerror = (event) => { setVoiceListening(false); setVoiceError(`Voice input: ${event.error}`) }
+      recognition.onresult = (event) => {
+        const last = event.results[event.results.length - 1]
+        if (last) voiceCommandRef.current(last[0].transcript.trim())
+      }
+      recognitionRef.current = recognition
+    }
+    if (voiceListening) {
+      recognitionRef.current.stop()
+    } else {
+      try { recognitionRef.current.start() } catch { setVoiceError('Voice input is already starting') }
+    }
+  }
+
+  const voiceSupported = typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition)
+
   const selectCamera = (id: CameraId) => setActiveCamera(id)
 
   if (!showConsole) {
-    return <ConnectScreen robotIp={robotIp} onRobotIpChange={setRobotIp} onStart={openTeleopView} error={connectionError} />
+    return <ConnectScreen robotIp={robotIp} onRobotIpChange={setRobotIp} onStart={openTeleopView} error={connectionError} voiceListening={voiceListening} voiceTranscript={voiceTranscript} voiceError={voiceError} voiceSupported={voiceSupported} onToggleVoice={toggleVoice} />
   }
 
   return (
@@ -112,8 +196,9 @@ function App() {
         </div>
         <div className="topbar-center"><span className="live-dot" />MOCK TELEMETRY <span className="divider" /> WEBXR READY</div>
         <div className="top-actions">
+          <VoiceControl listening={voiceListening} transcript={voiceTranscript} error={voiceError} supported={voiceSupported} onToggle={toggleVoice} compact />
           <button className="back-button" onClick={() => setShowConsole(false)}>MAIN</button>
-          <button className={`xr-button ${browserPreview ? 'preview-active' : ''}`} onClick={enterXR}><Icon name="headset" size={16} /> {browserPreview ? 'BROWSER PREVIEW' : 'ENTER XR'}</button>
+          <button className={`xr-button ${browserPreview ? 'preview-active' : ''}`} onClick={() => enterXR()}><Icon name="headset" size={16} /> {browserPreview ? 'BROWSER PREVIEW' : 'ENTER XR'}</button>
           <div className="system-time"><span>14:32:08</span><small>2025—06—17</small></div>
         </div>
       </header>
@@ -182,7 +267,7 @@ function App() {
   )
 }
 
-function ConnectScreen({ robotIp, onRobotIpChange, onStart, error }: { robotIp: string; onRobotIpChange: (value: string) => void; onStart: () => void; error: string }) {
+function ConnectScreen({ robotIp, onRobotIpChange, onStart, error, voiceListening, voiceTranscript, voiceError, voiceSupported, onToggleVoice }: { robotIp: string; onRobotIpChange: (value: string) => void; onStart: () => void; error: string; voiceListening: boolean; voiceTranscript: string; voiceError: string; voiceSupported: boolean; onToggleVoice: () => void }) {
   return (
     <main className="connect-shell">
       <div className="ambient ambient-one" /><div className="ambient ambient-two" />
@@ -191,7 +276,7 @@ function ConnectScreen({ robotIp, onRobotIpChange, onStart, error }: { robotIp: 
           <div className="brand-mark"><span /><span /><span /><span /></div>
           <div><div className="eyebrow">UNIT T-07 / OPERATOR CONSOLE</div><h1>TELEOPERATION</h1><p>WEBXR ROBOT CONTROL SYSTEM</p></div>
         </div>
-        <StatusDot label="SYSTEM READY" />
+        <div className="connect-header-actions"><VoiceControl listening={voiceListening} transcript={voiceTranscript} error={voiceError} supported={voiceSupported} onToggle={onToggleVoice} /><StatusDot label="SYSTEM READY" /></div>
       </header>
       <section className="connect-layout">
         <div className="connect-copy">
@@ -209,11 +294,20 @@ function ConnectScreen({ robotIp, onRobotIpChange, onStart, error }: { robotIp: 
           <button className="enter-vr-button" type="submit"><span><Icon name="headset" size={20} /> ENTER VR</span><Icon name="chevron" size={20} /></button>
           {error && <p className="connect-error">{error}</p>}
           <p className="connect-note">No HMD detected? The same flow opens Browser Preview so the interface can be tested before hardware is connected.</p>
+          <p className="voice-help"><Icon name="mic" size={13} /> Voice: say <b>“connect”</b> to enter the view</p>
         </form>
       </section>
       <footer className="connect-footer"><span><i /> HTTPS SECURE CONTEXT</span><span>WEBXR / CAMERA MOCKS ENABLED</span><span>BUILD 0.1.0</span></footer>
     </main>
   )
+}
+
+function VoiceControl({ listening, transcript, error, supported, onToggle, compact = false }: { listening: boolean; transcript: string; error: string; supported: boolean; onToggle: () => void; compact?: boolean }) {
+  return <div className={`voice-control ${listening ? 'listening' : ''} ${compact ? 'compact' : ''}`}>
+    <button className="voice-button" onClick={onToggle} title={supported ? 'Toggle voice commands' : 'Voice input is not supported'}><Icon name="mic" size={compact ? 15 : 17} /><span>{listening ? 'LISTENING' : compact ? 'VOICE' : 'VOICE COMMANDS'}</span><i className="voice-signal" /></button>
+    {!compact && transcript && <small className="voice-transcript">“{transcript}”</small>}
+    {!compact && error && <small className="voice-error">{error}</small>}
+  </div>
 }
 
 function StateRow({ label, value, tone = 'good' }: { label: string; value: string; tone?: 'good' | 'muted' }) { return <div className="state-row"><span><i className={`state-dot ${tone}`} />{label}</span><b className={tone}>{value}</b></div> }
