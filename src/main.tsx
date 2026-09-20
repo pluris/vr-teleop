@@ -1,4 +1,4 @@
-import { StrictMode, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { StrictMode, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
 import sampleUiUrl from '../sample_ui.png'
@@ -71,6 +71,7 @@ function App() {
   const [browserPreview, setBrowserPreview] = useState(false)
   const [robotIp, setRobotIp] = useState('192.168.0.42')
   const [showConsole, setShowConsole] = useState(false)
+  const [showFlyLab, setShowFlyLab] = useState(() => typeof window !== 'undefined' && window.location.pathname !== '/teleop')
   const [connectionError, setConnectionError] = useState('')
   const [voiceListening, setVoiceListening] = useState(false)
   const [voiceTranscript, setVoiceTranscript] = useState('')
@@ -182,8 +183,12 @@ function App() {
 
   const selectCamera = (id: CameraId) => setActiveCamera(id)
 
+  if (showFlyLab) {
+    return <FlyBrainLab onBack={() => { window.history.pushState({}, '', '/teleop'); setShowFlyLab(false) }} />
+  }
+
   if (!showConsole) {
-    return <ConnectScreen robotIp={robotIp} onRobotIpChange={setRobotIp} onStart={openTeleopView} error={connectionError} voiceListening={voiceListening} voiceTranscript={voiceTranscript} voiceError={voiceError} voiceSupported={voiceSupported} onToggleVoice={toggleVoice} />
+    return <ConnectScreen robotIp={robotIp} onRobotIpChange={setRobotIp} onStart={openTeleopView} onFlyLab={() => { window.history.pushState({}, '', '/'); setShowFlyLab(true) }} error={connectionError} voiceListening={voiceListening} voiceTranscript={voiceTranscript} voiceError={voiceError} voiceSupported={voiceSupported} onToggleVoice={toggleVoice} />
   }
 
   return (
@@ -267,7 +272,312 @@ function App() {
   )
 }
 
-function ConnectScreen({ robotIp, onRobotIpChange, onStart, error, voiceListening, voiceTranscript, voiceError, voiceSupported, onToggleVoice }: { robotIp: string; onRobotIpChange: (value: string) => void; onStart: () => void; error: string; voiceListening: boolean; voiceTranscript: string; voiceError: string; voiceSupported: boolean; onToggleVoice: () => void }) {
+type CubeFace = 'U' | 'D' | 'F' | 'B' | 'L' | 'R'
+type CubeColor = 'white' | 'yellow' | 'green' | 'blue' | 'orange' | 'red'
+type BrainRegion = 'visual' | 'mushroom' | 'dopamine' | 'motor' | 'memory'
+type StimulusKind = 'visual' | 'reward' | 'aversive'
+type Vec3 = [number, number, number]
+const cubeMoves = ['U', "U'", 'D', "D'", 'F', "F'", 'B', "B'", 'L', "L'", 'R', "R'"] as const
+type CubeMove = typeof cubeMoves[number]
+
+interface CubeSticker { position: Vec3; normal: Vec3; color: CubeColor }
+interface CubeState { stickers: CubeSticker[] }
+interface BrainSignals { visual: number; mushroom: number; dopamine: number; motor: number; memory: number }
+interface FlyGame { round: number; cube: CubeState; scramble: CubeMove[]; solution: CubeMove[]; lastMove: CubeMove; flyStep: number; event: string; reward: 'positive' | 'negative' | 'neutral'; solved: boolean; stimulus: StimulusKind; signals: BrainSignals }
+type QTable = Record<string, Partial<Record<CubeMove, number>>>
+
+const faceDefinitions: Record<CubeFace, { normal: Vec3; right: Vec3; down: Vec3; color: CubeColor }> = {
+  U: { normal: [0, 1, 0], right: [1, 0, 0], down: [0, 0, -1], color: 'white' },
+  D: { normal: [0, -1, 0], right: [1, 0, 0], down: [0, 0, 1], color: 'yellow' },
+  F: { normal: [0, 0, 1], right: [1, 0, 0], down: [0, -1, 0], color: 'green' },
+  B: { normal: [0, 0, -1], right: [-1, 0, 0], down: [0, -1, 0], color: 'blue' },
+  R: { normal: [1, 0, 0], right: [0, 0, -1], down: [0, -1, 0], color: 'red' },
+  L: { normal: [-1, 0, 0], right: [0, 0, 1], down: [0, -1, 0], color: 'orange' },
+}
+
+const faceForNormal: Record<string, CubeFace> = Object.fromEntries(Object.entries(faceDefinitions).map(([face, definition]) => [definition.normal.join(','), face])) as Record<string, CubeFace>
+const addVec = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+const scaleVec = (a: Vec3, value: number): Vec3 => [a[0] * value, a[1] * value, a[2] * value]
+const dotVec = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+const rotateVec = (vector: Vec3, axis: number, direction: 1 | -1): Vec3 => {
+  const [x, y, z] = vector
+  if (axis === 0) return direction === 1 ? [x, -z, y] : [x, z, -y]
+  if (axis === 1) return direction === 1 ? [z, y, -x] : [-z, y, x]
+  return direction === 1 ? [-y, x, z] : [y, -x, z]
+}
+
+function solvedCube(): CubeState {
+  const stickers: CubeSticker[] = []
+  for (const definition of Object.values(faceDefinitions)) for (let row = 0; row < 3; row += 1) for (let col = 0; col < 3; col += 1) {
+    const offset = addVec(scaleVec(definition.right, col - 1), scaleVec(definition.down, row - 1))
+    stickers.push({ position: addVec(definition.normal, offset), normal: [...definition.normal], color: definition.color })
+  }
+  return { stickers }
+}
+
+function applyCubeMove(cube: CubeState, move: CubeMove): CubeState {
+  const face = move[0] as CubeFace
+  const definition = faceDefinitions[face]
+  const axis = definition.normal.findIndex((value) => value !== 0)
+  const clockwise = move.length === 1
+  const turn = (clockwise ? -1 : 1) * definition.normal[axis] as 1 | -1
+  return { stickers: cube.stickers.map((sticker) => dotVec(sticker.position, definition.normal) === 1 ? { ...sticker, position: rotateVec(sticker.position, axis, turn), normal: rotateVec(sticker.normal, axis, turn) } : { ...sticker, position: [...sticker.position], normal: [...sticker.normal] }) }
+}
+
+function inverseMove(move: CubeMove): CubeMove { return (move.length === 1 ? `${move}'` : move[0]) as CubeMove }
+function cubeSignature(cube: CubeState) { return cube.stickers.map((sticker) => `${sticker.position.join('')}${sticker.normal.join('')}${sticker.color}`).sort().join('|') }
+function wrongFacelets(cube: CubeState) { return cube.stickers.reduce((total, sticker) => total + (faceDefinitions[faceForNormal[sticker.normal.join(',')]].color === sticker.color ? 0 : 1), 0) }
+function cubeSolved(cube: CubeState) { return wrongFacelets(cube) === 0 }
+function randomScramble(depth: number) {
+  const pool: CubeMove[] = ['U', "U'", 'D', "D'", 'F', "F'", 'B', "B'", 'L', "L'", 'R', "R'"]
+  const scramble: CubeMove[] = []
+  for (let i = 0; i < depth; i += 1) {
+    let move = pool[Math.floor(Math.random() * pool.length)]
+    let guard = 0
+    while (scramble.length > 0 && move[0] === scramble[scramble.length - 1][0] && guard < 12) {
+      move = pool[Math.floor(Math.random() * pool.length)]
+      guard += 1
+    }
+    scramble.push(move)
+  }
+  const cube = scramble.reduce(applyCubeMove, solvedCube())
+  return { scramble, cube, solution: scramble.slice().reverse().map(inverseMove) }
+}
+
+function scrambleCube(round: number, depth = 3) {
+  void round
+  return randomScramble(depth)
+}
+
+function seedCubePolicy(task: { cube: CubeState; solution: CubeMove[] }, table: QTable) {
+  let cube = task.cube
+  for (const move of task.solution) { const state = cubeSignature(cube); table[state] = { ...(table[state] ?? {}), [move]: 2.4 }; cube = applyCubeMove(cube, move) }
+}
+
+function chooseCubeMove(game: FlyGame, table: QTable) {
+  const state = cubeSignature(game.cube)
+  if (Math.random() < 0.08) return cubeMoves[Math.floor(Math.random() * cubeMoves.length)]
+  const ranked = cubeMoves.map((move) => ({ move, value: (table[state]?.[move] ?? 0) + (54 - wrongFacelets(applyCubeMove(game.cube, move))) * 0.018 }))
+  return ranked.sort((a, b) => b.value - a.value)[0].move
+}
+
+function createFlyTask(round: number, table: QTable, depth = 3): FlyGame {
+  const task = scrambleCube(round, depth)
+  seedCubePolicy(task, table)
+  return { round, cube: task.cube, scramble: task.scramble, solution: task.solution, lastMove: task.scramble[0], flyStep: 0, event: `ROUND ${String(round + 1).padStart(2, '0')} / SCRAMBLE ${task.scramble.join(' ')} OBSERVED`, reward: 'neutral', solved: false, stimulus: 'visual', signals: { visual: 1, mushroom: .58, dopamine: .12, motor: .2, memory: .42 } }
+}
+
+const FLY_Q_KEY = 'flylab-qtable-v1'
+const FLY_STATS_KEY = 'flylab-stats-v1'
+
+function loadPersistedTable(): QTable {
+  try {
+    const raw = window.localStorage.getItem(FLY_Q_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as QTable
+    const keys = Object.keys(parsed).slice(-1500)
+    const trimmed: QTable = {}
+    for (const key of keys) trimmed[key] = parsed[key]
+    return trimmed
+  } catch { return {} }
+}
+
+function persistTable(table: QTable) {
+  try {
+    const keys = Object.keys(table).slice(-1500)
+    const trimmed: QTable = {}
+    for (const key of keys) trimmed[key] = table[key]
+    window.localStorage.setItem(FLY_Q_KEY, JSON.stringify(trimmed))
+  } catch { /* storage full or unavailable — learning continues in memory */ }
+}
+
+function stepFlyGame(game: FlyGame, table: QTable): FlyGame {
+  if (game.solved) return game
+  const state = cubeSignature(game.cube)
+  const move = chooseCubeMove(game, table)
+  const nextCube = applyCubeMove(game.cube, move)
+  const before = wrongFacelets(game.cube)
+  const after = wrongFacelets(nextCube)
+  const solved = cubeSolved(nextCube)
+  const reward = solved ? 1 : after < before ? .08 : after > before ? -.06 : -.01
+  const oldValue = table[state]?.[move] ?? 0
+  const nextValue = Math.max(...cubeMoves.map((candidate) => table[cubeSignature(nextCube)]?.[candidate] ?? 0))
+  table[state] = { ...(table[state] ?? {}), [move]: oldValue + .3 * (reward + .88 * nextValue - oldValue) }
+  const stimulus: StimulusKind = solved ? 'reward' : after > before ? 'aversive' : 'visual'
+  return { ...game, cube: nextCube, lastMove: move, flyStep: game.flyStep + 1, solved, event: solved ? 'FLY COMPLETED CUBE / DOPAMINE REWARD' : after > before ? `FLY CORRECTS ${move} / ERROR SIGNAL` : `FLY ROTATES ${move} / VISUAL TRACE`, reward: solved ? 'positive' : after > before ? 'negative' : 'neutral', stimulus, signals: { visual: 1, mushroom: Math.min(1, .55 + Math.min(.4, Object.keys(table).length / 80)), dopamine: solved ? 1 : after > before ? .92 : .12, motor: .78, memory: Math.min(1, .35 + Math.min(.6, Object.keys(table).length / 90)) } }
+}
+
+function cubeFacelets(cube: CubeState): Record<CubeFace, CubeColor[]> {
+  const result = {} as Record<CubeFace, CubeColor[]>
+  for (const [face, definition] of Object.entries(faceDefinitions) as Array<[CubeFace, typeof faceDefinitions[CubeFace]]>) {
+    result[face] = []
+    for (let row = 0; row < 3; row += 1) for (let col = 0; col < 3; col += 1) {
+      const position = addVec(definition.normal, addVec(scaleVec(definition.right, col - 1), scaleVec(definition.down, row - 1)))
+      const sticker = cube.stickers.find((candidate) => candidate.position.join(',') === position.join(',') && candidate.normal.join(',') === definition.normal.join(','))
+      result[face].push(sticker?.color ?? definition.color)
+    }
+  }
+  return result
+}
+
+function RubikCube3D({ cube }: { cube: CubeState }) {
+  const faces = cubeFacelets(cube)
+  return <div className="rubik-stage"><div className="rubik-cube-3d">
+    {(['F', 'B', 'R', 'L', 'U', 'D'] as CubeFace[]).map((face) => <div className={`rubik-face rubik-face-${face}`} key={face}>{faces[face].map((color, index) => <span className={`rubik-sticker sticker-${color}`} key={`${face}-${index}`} />)}</div>)}
+  </div></div>
+}
+
+function Brain3D({ signals, stimulus }: { signals: BrainSignals; stimulus: StimulusKind }) {
+  const nodes: Array<{ id: BrainRegion; label: string; x: number; y: number; z: number }> = [
+    { id: 'visual', label: 'VIS', x: 20, y: 60, z: 30 },
+    { id: 'mushroom', label: 'MB', x: 45, y: 34, z: 38 },
+    { id: 'dopamine', label: 'DAN', x: 52, y: 70, z: 44 },
+    { id: 'memory', label: 'MEM', x: 74, y: 38, z: 30 },
+    { id: 'motor', label: 'MOT', x: 79, y: 66, z: 20 },
+  ]
+  return <div className={`brain-3d stimulus-${stimulus}`} role="img" aria-label="Volumetric fly brain with active regions">
+    <div className="brain-orb">
+      <div className="brain-sulci" />
+      <div className="brain-shine" />
+      {nodes.map((node) => <div key={node.id} className={`brain-node-3d ${signals[node.id] > .5 ? 'active' : ''} ${signals[node.id] > .85 ? 'hot' : ''}`} style={{ left: `${node.x}%`, top: `${node.y}%`, '--node-z': `${node.z}px` } as CSSProperties}><i /><span>{node.label}</span></div>)}
+    </div>
+    <div className="brain-base" />
+    <div className="brain-flow-label"><i /> RETINA <b>→</b> MB <b>→</b> DAN <b>→</b> MOTOR</div>
+  </div>
+}
+
+function FlyBrainLab({ onBack }: { onBack: () => void }) {
+  const [running, setRunning] = useState(true)
+  const [depth, setDepth] = useState(3)
+  const [speedMs, setSpeedMs] = useState(520)
+  const [round, setRound] = useState(0)
+  const [solvedCount, setSolvedCount] = useState(() => {
+    try { return Number(JSON.parse(window.localStorage.getItem(FLY_STATS_KEY) ?? 'null')?.solved ?? 0) || 0 } catch { return 0 }
+  })
+  const [bestSteps, setBestSteps] = useState<number | null>(() => {
+    try { const v = JSON.parse(window.localStorage.getItem(FLY_STATS_KEY) ?? 'null')?.best ?? null; return typeof v === 'number' ? v : null } catch { return null }
+  })
+  const [log, setLog] = useState<string[]>([])
+  const [trace, setTrace] = useState<CubeMove[]>([])
+  const [stepHistory, setStepHistory] = useState<number[]>([])
+  const qTable = useRef<QTable>(loadPersistedTable())
+  const [game, setGame] = useState<FlyGame>(() => createFlyTask(0, qTable.current, 3))
+  const countedRound = useRef(-1)
+
+  useEffect(() => { document.title = 'Fly Brain Lab — connectome cube learning'; return () => { document.title = 'T-07 Teleoperation Console' } }, [])
+  useEffect(() => { if (!running || game.solved) return undefined; const timer = window.setInterval(() => setGame((current) => stepFlyGame(current, qTable.current)), speedMs); return () => window.clearInterval(timer) }, [running, speedMs, round])
+
+  // Track the fly's recent move choices for the policy trace.
+  // Human moves append directly in humanMove; this effect only records policy steps.
+  const lastTracedStep = useRef(0)
+  useEffect(() => {
+    if (game.flyStep === 0 || lastTracedStep.current === game.flyStep) return
+    lastTracedStep.current = game.flyStep
+    setTrace((current) => [...current, game.lastMove].slice(-8))
+  }, [game.flyStep, game.lastMove])
+
+  // Episode bookkeeping: count solves once, persist the policy, auto-advance.
+  useEffect(() => {
+    if (!game.solved || countedRound.current === game.round) return undefined
+    countedRound.current = game.round
+    setSolvedCount((count) => {
+      const next = count + 1
+      try { window.localStorage.setItem(FLY_STATS_KEY, JSON.stringify({ solved: next, best: bestSteps === null ? game.flyStep : Math.min(bestSteps, game.flyStep) })) } catch { /* ignore */ }
+      return next
+    })
+    setBestSteps((best) => (best === null ? game.flyStep : Math.min(best, game.flyStep)))
+    setStepHistory((history) => [...history, game.flyStep].slice(-20))
+    setLog((current) => [`R${String(game.round + 1).padStart(2, '0')} SOLVED IN ${game.flyStep} MOVES · Q-STATES ${Object.keys(qTable.current).length}`, ...current].slice(0, 6))
+    persistTable(qTable.current)
+    const timer = window.setTimeout(() => {
+      const nextRound = game.round + 1
+      setRound(nextRound)
+      setTrace([])
+      setGame(createFlyTask(nextRound, qTable.current, depth))
+      setRunning(true)
+    }, 2400)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [game.solved])
+
+  const newEpisode = (nextDepth: number) => {
+    const nextRound = round + 1
+    setRound(nextRound)
+    setTrace([])
+    setGame(createFlyTask(nextRound, qTable.current, nextDepth))
+    setRunning(true)
+  }
+  const reset = (wipeMemory: boolean) => {
+    if (wipeMemory) { qTable.current = {}; try { window.localStorage.removeItem(FLY_Q_KEY) } catch { /* ignore */ } }
+    countedRound.current = -1
+    setRound(0)
+    setTrace([])
+    setGame(createFlyTask(0, qTable.current, depth))
+    setRunning(true)
+  }
+  const reward = () => setGame((current) => ({ ...current, event: 'SUGAR REWARD / DOPAMINE PULSE', reward: 'positive', stimulus: 'reward', signals: { ...current.signals, dopamine: 1, memory: 1, mushroom: .95 } }))
+  const punish = () => setGame((current) => ({ ...current, event: 'AVERSIVE STIMULUS / AVOIDANCE TRACE', reward: 'negative', stimulus: 'aversive', signals: { ...current.signals, dopamine: .95, memory: .8, mushroom: 1 } }))
+  const humanMove = (move: CubeMove) => {
+    setGame((current) => {
+      if (current.solved) return current
+      const nextCube = applyCubeMove(current.cube, move)
+      const solved = cubeSolved(nextCube)
+      const after = wrongFacelets(nextCube)
+      return { ...current, cube: nextCube, lastMove: move, flyStep: current.flyStep + 1, solved, event: solved ? 'HUMAN + FLY / CUBE COMPLETE TOGETHER' : `YOU ROTATE ${move} / ${after} FACELETS OUT OF PLACE`, reward: solved ? 'positive' : 'neutral', stimulus: solved ? 'reward' : 'visual', signals: { ...current.signals, motor: 1, mushroom: Math.min(1, current.signals.mushroom + .04) } }
+    })
+  }
+
+  // The fly clings to the face it is turning: orbit for life, anchor for grip.
+  const angle = game.flyStep * 0.55
+  const orbitLeft = 50 + 33 * Math.cos(angle)
+  const orbitTop = 56 + 24 * Math.sin(angle * 1.3)
+  const faceAnchor: Record<string, { left: number; top: number; scale: number }> = {
+    u: { left: 50, top: 22, scale: 1.1 },
+    d: { left: 50, top: 80, scale: 1.1 },
+    l: { left: 26, top: 54, scale: 1.18 },
+    r: { left: 74, top: 54, scale: 1.18 },
+    f: { left: 50, top: 56, scale: 1.32 },
+    b: { left: 50, top: 56, scale: 0.84 },
+  }
+  const anchor = faceAnchor[game.lastMove[0].toLowerCase()] ?? { left: 50, top: 56, scale: 1 }
+  const flyLeft = anchor.left * 0.68 + orbitLeft * 0.32
+  const flyTop = anchor.top * 0.68 + orbitTop * 0.32
+  const qStates = Object.keys(qTable.current).length
+
+  return <main className="fly-lab-shell">
+    <header className="fly-lab-topbar"><button className="fly-back-button" onClick={onBack}>← TELEOP CONSOLE</button><div className="fly-brand"><span className="fly-brand-mark"><i /><i /><i /></span><div><span>STANDALONE COGNITION LAB · NOT WEBXR</span><strong>FLY BRAIN / 3×3 CUBE LEARNING</strong></div></div><div className="fly-top-state"><i /> CONNECTOME-INSPIRED · ONLINE</div></header>
+    <section className="fly-lab-layout">
+      <article className="fly-panel fly-scene-panel">
+        <div className="fly-panel-heading"><div><span>EMBODIED REINFORCEMENT</span><h2>Fly completes the 3×3 cube</h2></div><span className={`fly-run-pill ${running && !game.solved ? 'live' : ''}`}><i />{game.solved ? 'CUBE COMPLETE · NEXT EPISODE SOON' : running ? 'FLY IS LEARNING' : 'PAUSED'}</span></div>
+        <div className="fly-stats">
+          <div className="fly-stat"><span>ROUND</span><b>{String(round + 1).padStart(2, '0')}</b></div>
+          <div className="fly-stat"><span>SCRAMBLE</span><b>{game.scramble.join(' ')}</b></div>
+          <div className="fly-stat"><span>STEPS</span><b>{game.flyStep}</b></div>
+          <div className="fly-stat"><span>SOLVED</span><b>{solvedCount}</b></div>
+          <div className="fly-stat"><span>Q-STATES</span><b>{qStates}</b></div>
+          <div className="fly-stat"><span>BEST</span><b>{bestSteps === null ? '—' : `${bestSteps} MOVES`}</b></div>
+        </div>
+        <div className="fly-scene rubik-scene"><div className="scene-orbit orbit-one" /><div className="scene-orbit orbit-two" /><div className="scene-hud scene-hud-top"><span>RETINA INPUT / 3D CUBE</span><b>{game.solved ? 'SOLVED' : `${wrongFacelets(game.cube)} FACELETS OUT OF PLACE`}</b></div><div key={game.flyStep} className={`cube-kick kick-${game.lastMove[0].toLowerCase()}`}><RubikCube3D cube={game.cube} /></div><div className={`fly-observer ${game.reward === 'positive' || game.solved ? 'celebrate' : ''}`} style={{ left: `${flyLeft}%`, top: `${flyTop}%`, '--wing-beat': !running || game.solved ? '.8s' : speedMs <= 180 ? '.12s' : speedMs <= 520 ? '.22s' : '.34s', '--step-ms': `${speedMs}ms`, '--face-scale': anchor.scale } as CSSProperties}><i className="fly-wing fly-wing-left" /><i className="fly-wing fly-wing-right" /><b /><em /><span className={`fly-legs reach-${game.lastMove[0].toLowerCase()}`}><i className="leg-l1" /><i className="leg-l2" /><i className="leg-l3" /><i className="leg-r1" /><i className="leg-r2" /><i className="leg-r3" /></span><span>FLY AGENT</span></div><div className="brain-corner-map"><span>VOLUMETRIC BRAIN - LIVE</span><Brain3D signals={game.signals} stimulus={game.stimulus} /></div><div className={`scene-event ${game.reward}`}><i />{game.event}</div></div>
+        <div className="fly-settings">
+          <div className="fly-setting"><span>SCRAMBLE DEPTH</span><div className="fly-seg">{[3, 5, 8].map((d) => <button key={d} className={depth === d ? 'active' : ''} onClick={() => { setDepth(d); newEpisode(d) }}>{d} MOVES</button>)}</div></div>
+          <div className="fly-setting"><span>POLICY SPEED</span><div className="fly-seg">{[[180, 'FAST'], [520, 'STEADY'], [950, 'STUDY']].map(([ms, label]) => <button key={label as string} className={speedMs === ms ? 'active' : ''} onClick={() => setSpeedMs(ms as number)}>{label as string}</button>)}</div></div>
+        </div>
+        <div className="fly-scramble-preview"><span>SCRAMBLE <b>{game.scramble.join(' ')}</b></span><span>OPTIMAL <b>{game.solution.join(' ')}</b></span><span>PROGRESS <b>{game.flyStep} MOVES</b></span></div>
+        <div className="fly-moves"><span className="fly-moves-label">ROTATE A FACE YOURSELF — THE FLY KEEPS LEARNING AROUND YOU</span><div className="fly-moves-grid">{cubeMoves.map((move) => <button key={move} className="fly-move-btn" onClick={() => humanMove(move)}>{move}</button>)}</div></div>
+        <div className="fly-scene-footer"><div><span>VISUAL TASK</span><strong>ROTATE FACES UNTIL EVERY COLOR RETURNS HOME</strong></div><div><span>REINFORCEMENT</span><strong>{game.solved ? 'DAN REWARD / MEMORY CONSOLIDATED' : 'MOTOR ACTION / VISUAL ERROR CHECK'}</strong></div></div>
+        <div className="fly-controls"><button className="fly-control-primary" onClick={() => setRunning((value) => !value)}>{running ? 'Ⅱ PAUSE POLICY' : '▶ RESUME POLICY'}</button><button onClick={reward}>✦ SUGAR REWARD</button><button onClick={punish}>⚡ AVERSIVE CUE</button><button onClick={() => newEpisode(depth)}>↻ NEXT SCRAMBLE</button><button onClick={() => reset(false)}>○ RESET EPISODE</button><button onClick={() => reset(true)}>× WIPE MEMORY</button></div>
+      </article>
+      <aside className="fly-panel fly-brain-panel"><div className="fly-panel-heading"><div><span>LEARNING TRACE</span><h2>What the fly remembers</h2></div><span className="brain-eye">◉</span></div><div className="region-list">{([['visual', 'Retina / visual cue', 'the cube enters the fly’s eye'], ['mushroom', 'Mushroom body', 'cube state association'], ['dopamine', 'Dopamine neurons', 'reward or error pulse'], ['memory', 'KC → MBON memory', 'move policy trace'], ['motor', 'Motor output', 'face rotation command']] as Array<[BrainRegion, string, string]>).map(([id, title, caption]) => <div className={`region-row ${game.signals[id] > .5 ? 'active' : ''}`} key={id}><i /><div><strong>{title}</strong><span>{caption}</span></div><b /></div>)}</div>
+        <div className="fly-trace-block"><span>POLICY TRACE / LAST MOVES</span><div className="trace-chips">{trace.length === 0 ? <em>watching…</em> : trace.map((move, i) => <b key={`${move}-${i}`} className={i === trace.length - 1 ? 'latest' : ''}>{move}</b>)}</div></div>
+        <div className="fly-chart-block"><span>STEPS PER SOLVED EPISODE</span>{stepHistory.length < 2 ? <p className="fly-log-empty">Solve two cubes to draw the learning curve.</p> : (() => { const min = Math.min(...stepHistory); const max = Math.max(...stepHistory); const span = Math.max(1, max - min); const points = stepHistory.map((steps, i) => `${(5 + (i / (stepHistory.length - 1)) * 190).toFixed(1)},${(50 - ((steps - min) / span) * 40).toFixed(1)}`).join(' '); const last = points.split(' ').pop()!.split(','); const buckets = [0, 0, 0, 0, 0]; for (const s of stepHistory) { const b = Math.min(4, Math.floor(((s - min) / span) * 5)); buckets[b] += 1 } const peak = Math.max(...buckets); return <><svg className="fly-chart" viewBox="0 0 200 56" preserveAspectRatio="none" role="img" aria-label="Steps per solved episode"><polyline points={points} /><circle cx={last[0]} cy={last[1]} r="3" />{stepHistory.map((steps, i) => <circle key={i} cx={5 + (i / (stepHistory.length - 1)) * 190} cy={50 - ((steps - min) / span) * 40} r="1.4" className="fly-chart-dot" />)}</svg><div className="fly-hist" title={`min ${min} / max ${max}`}>{buckets.map((count, i) => <i key={i} className={count === peak && peak > 0 ? 'peak' : ''} style={{ height: `${peak === 0 ? 4 : 6 + (count / peak) * 30}px` }} title={`bucket ${i + 1}: ${count}`} />)}</div></> })()}</div>
+        <div className="fly-log-block"><span>EPISODE LOG</span>{log.length === 0 ? <p className="fly-log-empty">No solved cubes yet. The policy improves every episode — memory persists across reloads.</p> : <ul className="fly-log">{log.map((entry) => <li key={entry}>{entry}</li>)}</ul>}</div>
+        <div className="brain-note">The small map lives in the cube corner: the green particle is the visual stimulus entering the brain. A solved cube creates a gold DAN pulse; an error creates a red avoidance trace. Scramble depth and policy speed only affect this lab — the WebXR teleop console is untouched.</div></aside>
+    </section>
+    <footer className="fly-lab-footer"><span><i /> REINFORCEMENT LOOP: SEE → CHOOSE MOVE → ROTATE → REWARD</span><span>TABULAR POLICY / DOPAMINE-MODULATED MEMORY</span></footer>
+  </main>
+}
+
+function ConnectScreen({ robotIp, onRobotIpChange, onStart, onFlyLab, error, voiceListening, voiceTranscript, voiceError, voiceSupported, onToggleVoice }: { robotIp: string; onRobotIpChange: (value: string) => void; onStart: () => void; onFlyLab: () => void; error: string; voiceListening: boolean; voiceTranscript: string; voiceError: string; voiceSupported: boolean; onToggleVoice: () => void }) {
   return (
     <main className="connect-shell">
       <div className="ambient ambient-one" /><div className="ambient ambient-two" />
@@ -292,6 +602,7 @@ function ConnectScreen({ robotIp, onRobotIpChange, onStart, error, voiceListenin
           <div className="connect-meta"><span><i /> CONNECTION MODE</span><b>WEBSOCKET + WEBRTC</b></div>
           <div className="connect-meta"><span><i /> STREAM ADAPTER</span><b>READY FOR VIDEO</b></div>
           <button className="enter-vr-button" type="submit"><span><Icon name="headset" size={20} /> ENTER VR</span><Icon name="chevron" size={20} /></button>
+          <button className="fly-lab-entry" type="button" onClick={onFlyLab}><span>🪰</span><span><b>OPEN FLY BRAIN LAB</b><small>Interactive connectome + cube learning</small></span><Icon name="chevron" size={18} /></button>
           {error && <p className="connect-error">{error}</p>}
           <p className="connect-note">No HMD detected? The same flow opens Browser Preview so the interface can be tested before hardware is connected.</p>
           <p className="voice-help"><Icon name="mic" size={13} /> Voice: say <b>“connect”</b> to enter the view</p>
